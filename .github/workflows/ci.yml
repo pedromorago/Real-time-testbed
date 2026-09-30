@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Long chaos run
+        run: npm run simulate -- --seed ${{ github.run_number }} --hands 300
+      - name: Seeded bugs
+        run: |
+          npm run --silent mutants | tee mutants.md
+          cat mutants.md >> "$GITHUB_STEP_SUMMARY"
