@@ -22,11 +22,30 @@ export interface Commit {
   lastSeq: number;
 }
 
+// A commit as it sits in the log, with the events it produced.
+export interface LogRecord {
+  commit: Commit;
+  events: TableEvent[];
+}
+
 export interface Store {
   append(commit: Commit, events: TableEvent[]): Promise<void>;
 }
 
 export const memoryStore: Store = { append: async () => {} };
+
+// A log kept in memory that outlives the service writing to it, so the
+// simulator and the checks can crash a service and restore another from it.
+// Records are copied through JSON, as they would be on disk.
+export class MemoryLog implements Store {
+  readonly records: LogRecord[] = [];
+  async append(commit: Commit, events: TableEvent[]) {
+    this.records.push(JSON.parse(JSON.stringify({ commit, events })));
+  }
+}
+
+// The log can't be trusted: a restore refuses to start from it.
+export class CorruptLogError extends Error {}
 
 export interface ServiceOptions {
   config: TableConfig;
@@ -70,8 +89,8 @@ export class TableService {
   }
 
   submit(from: string, commandId: string, command: Command): Promise<Response> {
-    const key = `${from}\u0000${commandId}`;
-    const fingerprint = JSON.stringify(command);
+    const key = keyOf(from, commandId);
+    const fingerprint = this.fingerprint(from, command);
     const known = this.seen.get(key);
     if (known && !this.faults.has("no-idempotency")) {
       if (known.fingerprint === fingerprint) return known.result;
@@ -81,6 +100,13 @@ export class TableService {
     const result = this.faults.has("no-command-queue") ? run() : (this.queue = this.queue.then(run, run));
     this.seen.set(key, { fingerprint, result: result as Promise<Response> });
     return result as Promise<Response>;
+  }
+
+  // What a retry must repeat to be the same command: the command as the
+  // server reads it, which is also what a commit records, so the cache can be
+  // rebuilt from the log.
+  private fingerprint(from: string, command: Command): string {
+    return JSON.stringify(this.authorize(from, command));
   }
 
   private authorize(from: string, command: Command): Command | Response {
@@ -95,29 +121,89 @@ export class TableService {
     const command = this.authorize(from, raw);
     if ("ok" in command) return command;
     const prev = this.state;
-    const res = apply(prev, command, this.faults);
+    let res: ReturnType<typeof apply>;
+    try {
+      res = apply(prev, command, this.faults);
+    } catch (e) {
+      // A bug in the engine. Most commands come from timers with nobody to
+      // hear a rejected promise, and an unhandled rejection kills Node.
+      this.violations.push(`${command.type} by ${from} threw: ${(e as Error).message}`);
+      return { ok: false, code: "internal_error", message: "the table could not apply this command" };
+    }
     if (!res.ok) return { ok: false, code: res.code, message: res.message };
 
-    // Persist before anyone sees the change. With the command queue in
-    // place nothing else touches the state while this awaits.
+    // Persist before anyone sees the change, so a crash can never take back
+    // an event a client already has. With the command queue in place nothing
+    // else touches the state while this awaits.
     const firstSeq = this.log.length + 1;
-    await this.store.append({ from, commandId, command, firstSeq, lastSeq: firstSeq + res.events.length - 1 }, res.events);
-
-    const seq0 = this.log.length + 1;
-    const commit: Commit = { from, commandId, command, firstSeq: seq0, lastSeq: seq0 + res.events.length - 1 };
-    this.state = res.state;
-    this.commits.push(commit);
+    const record = { from, commandId, command, firstSeq, lastSeq: firstSeq + res.events.length - 1 };
+    let commit: Commit;
+    if (this.faults.has("publish-before-persist")) {
+      commit = this.adopt(from, commandId, command, res.state, res.events);
+      await this.store.append(record, res.events);
+    } else {
+      await this.store.append(record, res.events);
+      commit = this.adopt(from, commandId, command, res.state, res.events);
+    }
     if (this.opts.audit) {
       const found = [...checkState(res.state), ...checkStep(prev, command, res.state, res.events)];
       for (const v of found) this.violations.push(`after ${command.type} by ${from}: ${v}`);
     }
-    for (const event of res.events) {
+    this.schedule();
+    return { ok: true, firstSeq: commit.firstSeq, lastSeq: commit.lastSeq };
+  }
+
+  // Makes a commit current: the new state, the commit, and its events
+  // numbered at the end of the log and sent to every subscriber.
+  private adopt(from: string, commandId: string, command: Command, state: TableState, events: TableEvent[]): Commit {
+    const seq0 = this.log.length + 1;
+    const commit: Commit = { from, commandId, command, firstSeq: seq0, lastSeq: seq0 + events.length - 1 };
+    this.state = state;
+    this.commits.push(commit);
+    for (const event of events) {
       const entry = { seq: this.log.length + 1, event };
       this.log.push(entry);
       for (const s of this.subscribers) s.send(entry);
     }
-    this.schedule();
-    return { ok: true, firstSeq: commit.firstSeq, lastSeq: commit.lastSeq };
+    return commit;
+  }
+
+  // A service rebuilt from its log after a crash. Every commit is replayed
+  // through the engine and must reproduce the events it recorded, in seq
+  // order with no gap, or the restore refuses to start. Accepted commands go
+  // back into the idempotency cache with their original result, and the
+  // action timer or next-hand start is armed again for the restored table.
+  // Rejected commands were never logged: a retry is decided afresh.
+  static restore(opts: ServiceOptions, records: LogRecord[]): TableService {
+    const svc = new TableService(opts);
+    svc.load(records);
+    return svc;
+  }
+
+  private load(records: LogRecord[]) {
+    const verify = !this.faults.has("restore-trusts-log");
+    const kept = this.faults.has("restore-drops-last") ? records.slice(0, -1) : records;
+    for (const [i, record] of kept.entries()) {
+      const { commit: c, events } = record ?? {};
+      const at = `log record ${i + 1} (${c?.from}/${c?.commandId})`;
+      if (verify && (!c || typeof c.from !== "string" || !Array.isArray(events))) throw new CorruptLogError(`${at}: not a commit`);
+      const res = apply(this.state, c.command, this.faults);
+      if (verify) {
+        if (this.fingerprint(c.from, c.command) !== JSON.stringify(c.command)) throw new CorruptLogError(`${at}: ${c.from} can't send ${JSON.stringify(c.command)}`);
+        if (c.firstSeq !== this.log.length + 1 || c.lastSeq !== c.firstSeq + events.length - 1)
+          throw new CorruptLogError(`${at}: holds events ${c.firstSeq} to ${c.lastSeq}, expected ${events.length} events from ${this.log.length + 1}`);
+        if (!res.ok) throw new CorruptLogError(`${at}: ${c.command.type} is rejected on replay: ${res.code}`);
+        const k = events.findIndex((e, j) => JSON.stringify(e) !== JSON.stringify(res.events[j]));
+        if (k >= 0 || events.length !== res.events.length)
+          throw new CorruptLogError(`${at}: event ${c.firstSeq + (k >= 0 ? k : events.length)} differs from the replay`);
+      }
+      this.adopt(c.from, c.commandId, c.command, res.ok ? res.state : this.state, events);
+      if (!this.faults.has("restore-no-idempotency")) {
+        const result: Response = { ok: true, firstSeq: c.firstSeq, lastSeq: c.lastSeq };
+        this.seen.set(keyOf(c.from, c.commandId), { fingerprint: JSON.stringify(c.command), result: Promise.resolve(result) });
+      }
+    }
+    if (!this.faults.has("restore-no-timers")) this.schedule();
   }
 
   // Timers are never cancelled. A timer that fires after its turn is over is
@@ -153,6 +239,8 @@ export class TableService {
     return this.log.length;
   }
 }
+
+const keyOf = (from: string, commandId: string) => `${from}\u0000${commandId}`;
 
 // Re-runs the accepted commands from an empty table.
 export function replay(config: TableConfig, commits: Commit[], faults: Faults = NO_FAULTS): { state: TableState; events: TableEvent[]; errors: string[] } {

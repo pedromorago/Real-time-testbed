@@ -2,6 +2,7 @@ import { parseCards } from "../src/engine/cards.ts";
 import type { Faults } from "../src/engine/faults.ts";
 import { apply } from "../src/engine/table.ts";
 import type { Command, TableConfig, TableState } from "../src/engine/types.ts";
+import type { LogRecord, MemoryLog, Store } from "../src/server/service.ts";
 import { TableService } from "../src/server/service.ts";
 
 export const CONFIG: TableConfig = { seats: 6, smallBlind: 1, bigBlind: 2, minBuyIn: 10, maxBuyIn: 1000, seed: 11 };
@@ -65,3 +66,25 @@ export function service(faults: Faults, extra: Partial<ConstructorParameters<typ
   const svc = new TableService({ config: CONFIG, faults, scheduler, actionTimeoutMs: 1000, audit: true, ...extra });
   return { svc, scheduler };
 }
+
+// A new process after a crash: a service restored from what reached the disk.
+export function restart(records: LogRecord[], faults: Faults, extra: Partial<ConstructorParameters<typeof TableService>[0]> = {}) {
+  const scheduler = new ManualScheduler();
+  const svc = TableService.restore({ config: CONFIG, faults, scheduler, actionTimeoutMs: 1000, audit: true, ...extra }, records);
+  return { svc, scheduler };
+}
+
+// Storage in a process about to die. After die(), the next write either
+// never reaches the disk or reaches it and is never acknowledged.
+export function dyingStore(disk: MemoryLog) {
+  let fate: "before-write" | "after-write" | null = null;
+  const store: Store = {
+    async append(commit, events) {
+      if (fate !== "before-write") await disk.append(commit, events);
+      if (fate) await new Promise(() => {});
+    },
+  };
+  return { store, die: (when: "before-write" | "after-write") => void (fate = when) };
+}
+
+export const tick = () => new Promise((r) => setImmediate(r));

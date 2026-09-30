@@ -137,7 +137,8 @@ export type RejectCode =
   | "raise_too_small"
   | "insufficient_chips"
   | "not_authorized"
-  | "idempotency_conflict";
+  | "idempotency_conflict"
+  | "internal_error";
 
 export type Result =
   | { ok: true; state: TableState; events: TableEvent[] }

@@ -16,8 +16,10 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - name: Long chaos run
+      - name: Long chaos run with server crashes
         run: npm run simulate -- --seed ${{ github.run_number }} --hands 300
+      - name: Crash storm
+        run: npm run simulate -- --seed ${{ github.run_number }} --hands 300 --crash 2000
       - name: Seeded bugs
         run: |
           npm run --silent mutants | tee mutants.md

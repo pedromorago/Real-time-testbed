@@ -6,9 +6,11 @@ import { TableClient } from "../src/client/client.ts";
 import { connectWs } from "../src/client/ws-client.ts";
 import { viewOf } from "../src/engine/view.ts";
 import type { Response } from "../src/server/protocol.ts";
-import { readLog, fileStore } from "../src/server/file-store.ts";
+import { readLog, fileStore, resumeFileStore } from "../src/server/file-store.ts";
+import { realScheduler } from "../src/server/scheduler.ts";
 import { replay, TableService } from "../src/server/service.ts";
 import { listen } from "../src/server/ws.ts";
+import { ServerProcess } from "../src/sim/crash.ts";
 import { CONFIG, slowStore } from "../validation/helpers.ts";
 
 // The same guarantees as the simulator, over real sockets and real timers.
@@ -130,10 +132,63 @@ describe("over WebSockets", () => {
     a.c.send({ type: "sit", playerId: "p1", seat: 0, buyIn: 100 });
     b.c.send({ type: "sit", playerId: "p2", seat: 1, buyIn: 100 });
     await until(() => service.state.handsPlayed === 3);
-    const { config, entries } = readLog(path);
-    const r = replay(config, entries.map((e) => e.commit));
+    const { config, records } = readLog(path);
+    const r = replay(config, records.map((e) => e.commit));
     expect(r.errors).toEqual([]);
     expect(r.events).toEqual(service.log.map((e) => e.event));
     expect(r.state).toEqual(service.state);
+  });
+
+  it("the server dies mid-hand, a new one starts from the log file, and every client carries on", async () => {
+    const path = pathJoin(mkdtempSync(pathJoin(tmpdir(), "rtt-")), "table.jsonl");
+    const timing = { audit: true, nextHandDelayMs: 20, actionTimeoutMs: 30 };
+    const first = new ServerProcess(realScheduler, fileStore(path, CONFIG));
+    const before = new TableService({ config: CONFIG, store: first.store, scheduler: first.scheduler, ...timing });
+    const server = await listen(before);
+    stop = async () => {
+      first.kill();
+      await server.close();
+    };
+    const url = `ws://localhost:${server.port}`;
+    const clients = [new TableClient("p1", CONFIG.seats), new TableClient("p2", CONFIG.seats), new TableClient(null, CONFIG.seats)];
+    for (const c of clients) await connectWs(c, url);
+    clients[0].send({ type: "sit", playerId: "p1", seat: 0, buyIn: 100 });
+    clients[1].send({ type: "sit", playerId: "p2", seat: 1, buyIn: 100 });
+    await until(() => before.state.handsPlayed >= 2 && before.state.hand !== null && converged(before, ...clients));
+
+    // Kill it: timers and unfinished writes die with the process, sockets drop.
+    await stop();
+    await until(() => clients.every((c) => !c.connected));
+    // The player to act answers while the server is down.
+    const actor = clients.find((c) => c.turn && c.view.hand?.toAct === c.seat && c.turn.seat === c.seat)!;
+    const t = actor.turn!;
+    const offline = actor.send({ type: "act", playerId: actor.playerId!, handId: t.handId, turn: t.turn, action: t.toCall ? { kind: "call" } : { kind: "check" } });
+
+    const log = resumeFileStore(path);
+    const second = new ServerProcess(realScheduler, log.store);
+    const after = TableService.restore({ config: log.config, store: second.store, scheduler: second.scheduler, ...timing }, log.records);
+    // Everything published survives. A write that reached the disk just
+    // before the kill, unacknowledged, may add one more commit.
+    expect(after.log.slice(0, before.head)).toEqual(before.log);
+    expect(after.commits.length - before.commits.length).toBeLessThanOrEqual(1);
+    const restarted = await listen(after, server.port);
+    stop = async () => {
+      second.kill();
+      await restarted.close();
+    };
+    for (const c of clients) await connectWs(c, url);
+    const played = after.state.handsPlayed;
+    await until(() => after.state.handsPlayed >= played + 3 && converged(after, ...clients));
+
+    expect(clients.flatMap((c) => c.anomalies)).toEqual([]);
+    // The offline action was applied once if it was told ok, never otherwise.
+    const applied = after.commits.filter((c) => c.from === actor.playerId && c.commandId === offline);
+    expect(applied).toHaveLength((await resultOf(actor, offline)).ok ? 1 : 0);
+    const { config, records, torn } = readLog(path);
+    expect(torn).toBeNull();
+    const r = replay(config, records.map((e) => e.commit));
+    expect(r.errors).toEqual([]);
+    expect(r.events).toEqual(after.log.map((e) => e.event));
+    expect(r.state).toEqual(after.state);
   });
 });

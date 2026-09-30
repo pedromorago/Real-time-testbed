@@ -13,6 +13,11 @@ export const FAULTS = {
   "min-raise-ignored": "Raises smaller than the minimum raise are accepted",
   "client-no-dedupe": "The client applies an event again when it arrives twice",
   "client-no-reorder": "The client applies events in arrival order, not sequence order",
+  "publish-before-persist": "Events are published before they are persisted, so a crash can take back events clients already saw",
+  "restore-no-idempotency": "After a restart, commands applied before the crash are not remembered, so their retries run again",
+  "restore-drops-last": "Restoring from the log leaves out the last commit",
+  "restore-no-timers": "After a restart, the action timer and the next-hand start are not armed again",
+  "restore-trusts-log": "Restoring takes the logged events on trust instead of checking them against a replay of the commands",
 } as const;
 
 export type Fault = keyof typeof FAULTS;

@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
 import fc from "fast-check";
-import { parseCards } from "../src/engine/cards.ts";
+import { parseCards, rng } from "../src/engine/cards.ts";
 import { Category, categoryOf, evaluate } from "../src/engine/evaluator.ts";
 import type { Faults } from "../src/engine/faults.ts";
 import { checkState, checkStep } from "../src/engine/invariants.ts";
 import { apply, newTable } from "../src/engine/table.ts";
 import type { Command, TableEvent, TableState } from "../src/engine/types.ts";
-import { replay, SYSTEM } from "../src/server/service.ts";
+import { parseLog } from "../src/server/file-store.ts";
+import { CorruptLogError, MemoryLog, replay, SYSTEM, TableService } from "../src/server/service.ts";
 import { simulate } from "../src/sim/simulation.ts";
-import { act, CONFIG, play, rig, run, service, slowStore, whoActs } from "./helpers.ts";
+import { act, CONFIG, dyingStore, play, restart, rig, run, service, slowStore, tick, whoActs } from "./helpers.ts";
 
-export type Layer = "reference" | "property" | "protocol" | "concurrency" | "chaos";
+export type Layer = "reference" | "property" | "protocol" | "concurrency" | "chaos" | "recovery";
 
 export interface Check {
   id: string;
@@ -21,6 +22,19 @@ export interface Check {
 
 const sitAll = (stacks: number[]): Command[] => stacks.map((buyIn, i) => ({ type: "sit", playerId: `p${i}`, seat: i, buyIn }));
 const eventsOf = (svc: { log: { event: TableEvent }[] }) => svc.log.map((e) => e.event);
+const upTo = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
+
+// Two players seated and a hand dealt, and the command for the first action.
+async function handInProgress(svc: TableService) {
+  await svc.submit("p1", "a", { type: "sit", playerId: "p1", seat: 0, buyIn: 100 });
+  await svc.submit("p2", "b", { type: "sit", playerId: "p2", seat: 1, buyIn: 100 });
+  await svc.submit(SYSTEM, "s", { type: "start" });
+  const h = svc.state.hand!;
+  const actor = svc.state.seats[h.toAct!]!.playerId;
+  const cmd: Command = { type: "act", playerId: actor, handId: h.id, turn: h.turn, action: { kind: "call" } };
+  return { h, actor, cmd };
+}
+
 
 export const CHECKS: Check[] = [
   // Reference: hand-written expectations, only where they are beyond argument.
@@ -256,6 +270,175 @@ export const CHECKS: Check[] = [
           if (r.violations.length) throw new Error(`seed ${seed}: ${r.violations.slice(0, 3).join("; ")}`);
         }),
         { seed: 7, numRuns: 20 },
+      );
+    },
+  },
+
+  // Recovery: the server dies at any moment and a new one starts from the log.
+  {
+    id: "restore-exact",
+    layer: "recovery",
+    title: "Restoring from prefixes of a 400-command log rebuilds the same table, events, seq numbers and commits",
+    async run(faults) {
+      const disk = new MemoryLog();
+      const { svc } = service(faults, { store: disk });
+      const random = rng(3);
+      const n = (k: number) => Math.floor(random() * k);
+      const snapshots = [{ state: JSON.stringify(svc.state), head: 0 }];
+      for (let i = 0; i < 400; i++) {
+        const cmd = randomCommand(svc.state, n(100), n(100), n(1000));
+        const from = cmd.type === "start" || cmd.type === "timeout" ? SYSTEM : cmd.playerId;
+        const res = await svc.submit(from, `c${i}`, cmd);
+        if (res.ok) snapshots.push({ state: JSON.stringify(svc.state), head: svc.head });
+      }
+      assert.ok(snapshots.length > 100, "the session should accept plenty of commands");
+      const last = disk.records.length;
+      for (const k of [...upTo(20), ...upTo(last).filter((k) => k % 9 === 0), last - 1, last]) {
+        const { svc: restored } = restart(disk.records.slice(0, k), faults);
+        assert.equal(JSON.stringify(restored.state), snapshots[k].state, `the table after ${k} commits`);
+        assert.equal(restored.head, snapshots[k].head, `the head after ${k} commits`);
+        assert.deepEqual(restored.log, svc.log.slice(0, snapshots[k].head), `the numbered events after ${k} commits`);
+        assert.deepEqual(restored.commits, svc.commits.slice(0, k));
+      }
+    },
+  },
+  {
+    id: "retry-after-restart",
+    layer: "recovery",
+    title: "A command applied before a crash and retried after it gets its original result and is applied once",
+    async run(faults) {
+      const disk = new MemoryLog();
+      const { svc } = service(faults, { store: disk });
+      const sit: Command = { type: "sit", playerId: "p1", seat: 0, buyIn: 100 };
+      const first = await svc.submit("p1", "c1", sit);
+      const taken = await svc.submit("p2", "c2", { type: "sit", playerId: "p2", seat: 0, buyIn: 100 });
+      assert.equal(taken.ok ? "accepted" : taken.code, "seat_taken");
+      const { svc: next } = restart(disk.records, faults);
+      assert.deepEqual(await next.submit("p1", "c1", sit), first);
+      assert.equal(eventsOf(next).filter((e) => e.type === "PlayerSat").length, 1);
+      const reused = await next.submit("p1", "c1", { type: "leave", playerId: "p1" });
+      assert.equal(reused.ok ? "accepted" : reused.code, "idempotency_conflict");
+      // Rejections are not logged: a retry is decided again, on the same table.
+      const again = await next.submit("p2", "c2", { type: "sit", playerId: "p2", seat: 0, buyIn: 100 });
+      assert.equal(again.ok ? "accepted" : again.code, "seat_taken");
+    },
+  },
+  {
+    id: "crash-before-publish",
+    layer: "recovery",
+    title: "A crash after a commit reached the disk but before it was published: on resume each event arrives exactly once",
+    async run(faults) {
+      const disk = new MemoryLog();
+      const dying = dyingStore(disk);
+      const { svc } = service(faults, { store: dying.store });
+      const seen: number[] = [];
+      svc.subscribe("p1", 0, (e) => seen.push(e.seq));
+      const { actor, cmd } = await handInProgress(svc);
+      const head = disk.records.at(-1)!.commit.lastSeq;
+      dying.die("after-write");
+      void svc.submit(actor, "x", cmd);
+      await tick();
+      assert.equal(disk.records.length, 4, "the action should be on disk");
+      const { svc: next } = restart(disk.records, faults);
+      next.subscribe("p1", seen.at(-1)!, (e) => seen.push(e.seq));
+      assert.ok(next.head > head, "the restored table is missing the action");
+      assert.deepEqual(seen, upTo(next.head), "p1 should see every event once, in order");
+      const retry = await next.submit(actor, "x", cmd);
+      assert.deepEqual(retry, { ok: true, firstSeq: head + 1, lastSeq: disk.records[3].commit.lastSeq }, "the retry should get the original result");
+      assert.equal(next.head, seen.length, "the retry was applied again");
+    },
+  },
+  {
+    id: "crash-before-persist",
+    layer: "recovery",
+    title: "A crash while a command is being persisted: no client saw its events, and its retry is applied once",
+    async run(faults) {
+      const disk = new MemoryLog();
+      const dying = dyingStore(disk);
+      const { svc } = service(faults, { store: dying.store });
+      const seen: number[] = [];
+      svc.subscribe("p1", 0, (e) => seen.push(e.seq));
+      const { h, actor, cmd } = await handInProgress(svc);
+      dying.die("before-write");
+      void svc.submit(actor, "x", cmd);
+      await tick();
+      const { svc: next } = restart(disk.records, faults);
+      assert.ok(seen.at(-1)! <= next.head, `p1 saw event ${seen.at(-1)}, the restored table ends at ${next.head}`);
+      next.subscribe("p1", seen.at(-1)!, (e) => seen.push(e.seq));
+      const retry = await next.submit(actor, "x", cmd);
+      assert.ok(retry.ok, "the retry should be applied");
+      assert.deepEqual(seen, upTo(next.head));
+      assert.equal(eventsOf(next).filter((e) => e.type === "ActionTaken" && e.handId === h.id && e.turn === h.turn).length, 1);
+    },
+  },
+  {
+    id: "restart-rearms-timers",
+    layer: "recovery",
+    title: "After a crash mid-hand the player to act still times out, and after a crash between hands the next hand is dealt",
+    async run(faults) {
+      const disk = new MemoryLog();
+      const { svc } = service(faults, { store: disk });
+      const { h } = await handInProgress(svc);
+      const first = restart(disk.records, faults, { store: disk });
+      for (const t of first.scheduler.timers.splice(0)) t.fn();
+      await tick();
+      const timedOut = eventsOf(first.svc).some((e) => e.type === "ActionTaken" && e.handId === h.id && e.turn === h.turn && e.timeout);
+      assert.ok(timedOut, "nobody timed out the player to act");
+      assert.equal(first.svc.state.hand, null, "heads-up, a timed-out small blind folds and the hand ends");
+      const second = restart(disk.records, faults);
+      for (const t of second.scheduler.timers.splice(0)) t.fn();
+      await tick();
+      assert.equal(second.svc.state.hand?.id, h.id + 1, "the next hand was not dealt");
+    },
+  },
+  {
+    id: "corrupt-log-refused",
+    layer: "recovery",
+    title: "A restore refuses a log with a missing commit, an edited event or a forged sender, and drops only a torn last line",
+    async run(faults) {
+      const disk = new MemoryLog();
+      const { svc } = service(faults, { store: disk });
+      const { actor, cmd } = await handInProgress(svc);
+      await svc.submit(actor, "x", cmd);
+      const good = disk.records;
+      assert.equal(restart(good, faults).svc.head, svc.head);
+      const edit = (fn: (r: typeof good) => void) => {
+        const r = structuredClone(good);
+        fn(r);
+        return r;
+      };
+      const bad = {
+        "a missing commit": edit((r) => r.splice(1, 1)),
+        "an edited event": edit((r) => void ((r[1].events[0] as { stack: number }).stack += 1)),
+        "a forged sender": edit((r) => void (r[1].commit.from = "p1")),
+        "shifted seq numbers": edit((r) => r.slice(2).forEach((x) => ((x.commit.firstSeq += 1), (x.commit.lastSeq += 1)))),
+      };
+      for (const [what, records] of Object.entries(bad)) assert.throws(() => restart(records, faults), CorruptLogError, `restored a log with ${what}`);
+
+      const lines = [JSON.stringify({ config: CONFIG }), ...good.map((r) => JSON.stringify(r))];
+      const text = lines.join("\n") + "\n";
+      const torn = parseLog(text + lines[2].slice(0, 30));
+      assert.equal(torn.records.length, good.length);
+      assert.equal(torn.bytes, text.length);
+      assert.ok(torn.torn);
+      assert.equal(parseLog(text).torn, null);
+      const middle = [...lines.slice(0, 2), lines[2].slice(0, 30), ...lines.slice(3)].join("\n") + "\n";
+      assert.throws(() => parseLog(middle), CorruptLogError, "a torn line in the middle is corruption");
+    },
+  },
+  {
+    id: "crash-games",
+    layer: "recovery",
+    title: "Games with server crashes on top of the network chaos: every client converges and the log replays",
+    async run(faults) {
+      const chaos = { latencyMs: 20, jitterMs: 80, duplicateRate: 0.1, disconnectEveryMs: 4000, reconnectAfterMs: 300, crashEveryMs: 3000, restartAfterMs: 500 };
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 1, max: 2 ** 31 - 1 }), async (seed) => {
+          const r = await simulate({ seed, chaos, hands: 12, faults });
+          if (r.violations.length) throw new Error(`seed ${seed}: ${r.violations.slice(0, 3).join("; ")}`);
+          if (r.crashes === 0) throw new Error(`seed ${seed}: the server never crashed`);
+        }),
+        { seed: 7, numRuns: 12 },
       );
     },
   },

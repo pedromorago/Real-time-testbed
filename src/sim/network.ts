@@ -10,6 +10,8 @@ export interface Chaos {
   duplicateRate: number; // chance a command, event or result is delivered twice
   disconnectEveryMs: number; // mean time between dropped connections, 0 for never
   reconnectAfterMs: number;
+  crashEveryMs?: number; // mean time between server crashes, 0 or absent for never
+  restartAfterMs?: number; // how long the server stays down
 }
 
 export const CALM: Chaos = { latencyMs: 5, jitterMs: 0, duplicateRate: 0, disconnectEveryMs: 0, reconnectAfterMs: 50 };
@@ -20,6 +22,7 @@ export const CALM: Chaos = { latencyMs: 5, jitterMs: 0, duplicateRate: 0, discon
 // whole connection drops now and then, losing everything in flight. A single
 // WebSocket is kinder than this (TCP keeps order and never duplicates), but
 // retries across reconnects, several tabs and proxies bring all of it back.
+// While the server is down, connecting fails and the client tries again.
 export class ChaosLink {
   private epoch = 0;
   private connected = false;
@@ -29,13 +32,15 @@ export class ChaosLink {
   constructor(
     private readonly clock: VirtualClock,
     private readonly random: () => number,
-    private readonly service: TableService,
+    private readonly server: () => TableService | null,
     readonly client: TableClient,
     private readonly chaos: Chaos,
   ) {}
 
   connect() {
     const epoch = ++this.epoch;
+    const service = this.server();
+    if (!service) return void this.clock.after(this.chaos.reconnectAfterMs, () => this.connect());
     this.connected = true;
     this.connections++;
     const deliver = (dup: boolean, fn: () => void) => {
@@ -45,7 +50,7 @@ export class ChaosLink {
       if (dup && !this.calm && this.random() < this.chaos.duplicateRate)
         this.clock.after(this.chaos.latencyMs + this.random() * jitter * 2, go);
     };
-    const server = openConnection(this.service, (m: ServerMsg) => deliver(m.t !== "welcome", () => this.client.receive(m)));
+    const server = openConnection(service, (m: ServerMsg) => deliver(m.t !== "welcome", () => this.client.receive(m)));
     this.client.attach({ send: (m: ClientMsg) => deliver(m.t === "cmd", () => server.receive(m)) });
     this.drop = () => {
       if (this.epoch !== epoch || !this.connected) return;

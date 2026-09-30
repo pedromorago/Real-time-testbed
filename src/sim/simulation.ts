@@ -3,8 +3,9 @@ import { rng } from "../engine/cards.ts";
 import { type Faults, NO_FAULTS } from "../engine/faults.ts";
 import type { Action, TableConfig } from "../engine/types.ts";
 import { viewOf } from "../engine/view.ts";
-import { replay, TableService } from "../server/service.ts";
+import { CorruptLogError, MemoryLog, replay, type ServiceOptions, TableService } from "../server/service.ts";
 import { VirtualClock } from "./clock.ts";
+import { ServerProcess, type WriteStage } from "./crash.ts";
 import { type Chaos, ChaosLink } from "./network.ts";
 
 export interface SimOptions {
@@ -25,6 +26,12 @@ export interface SimResult {
   rejected: number;
   timeouts: number;
   reconnects: number;
+  crashes: number;
+  crashesMidHand: number;
+  // Crashes that landed with a write not on disk yet, and with a write on
+  // disk whose events had not been published yet.
+  crashesBeforeWrite: number;
+  crashesBeforePublish: number;
   virtualMs: number;
 }
 
@@ -76,31 +83,110 @@ export async function simulate(opts: SimOptions): Promise<SimResult> {
   const clock = new VirtualClock();
   const random = rng(seed);
   const config: TableConfig = { seats: 6, smallBlind: 1, bigBlind: 2, minBuyIn: 40, maxBuyIn: 200, seed };
-  const service = new TableService({
+  const options = (proc: ServerProcess): ServiceOptions => ({
     config,
     faults,
-    scheduler: clock,
-    store: { append: () => new Promise((resolve) => clock.after(random() * storeLatencyMs, resolve)) },
+    scheduler: proc.scheduler,
+    store: proc.store,
     actionTimeoutMs,
     nextHandDelayMs: 100,
     maxHands: hands,
     audit: true,
   });
 
+  // The disk outlives the server. Each life of the server is a process on
+  // top of it; a crash throws the process away with everything in memory:
+  // the table, the queue, commands waiting to be persisted, the timers.
+  const disk = new MemoryLog();
+  const violations: string[] = [];
+  const stats = { crashes: 0, crashesMidHand: 0, crashesBeforeWrite: 0, crashesBeforePublish: 0 };
+  // Half the crashes strike at a random moment. The other half wait for the
+  // next write and strike at one of its stages: the instant before it reaches
+  // the disk, on disk but not yet published, or published but not delivered.
+  const crashRandom = rng(seed * 15485863 + 1);
+  const stages: WriteStage[] = ["reaching-disk", "on-disk", "acknowledged"];
+  let aimed: WriteStage | null = null;
+  let calm = false;
+  let up = true;
+  let broken = false;
+  // One write in ten is slow, as when a flush queues behind other I/O.
+  const writeTime = () => random() * storeLatencyMs * (random() < 0.1 ? 10 : 1);
+  const boot = () => {
+    const p = new ServerProcess(clock, disk, writeTime);
+    p.onWrite = (stage) => {
+      if (stage !== aimed || p !== proc) return;
+      aimed = null;
+      if (stage === "acknowledged") clock.after(0, crash);
+      else crash();
+    };
+    return p;
+  };
+  let proc = boot();
+  let service = new TableService(options(proc));
+
   const clients = Array.from({ length: players }, (_, i) => new TableClient(`p${i + 1}`, config.seats, faults));
   clients.push(new TableClient(null, config.seats, faults)); // a spectator
-  const links = clients.map((c, i) => new ChaosLink(clock, rng(seed * 7919 + i), service, c, chaos));
+  const links = clients.map((c, i) => new ChaosLink(clock, rng(seed * 7919 + i), () => (up ? service : null), c, chaos));
   const bots = clients.map((c, i) => (c.playerId ? bot(c, clock, rng(seed * 104729 + i), config, actionTimeoutMs) : null));
   links.forEach((link, i) => clock.after(i * 7, () => link.connect()));
 
+  function crash() {
+    if (calm || !up) return;
+    stats.crashes++;
+    if (service.state.hand) stats.crashesMidHand++;
+    if (proc.writing) stats.crashesBeforeWrite++;
+    if (proc.unacknowledged) stats.crashesBeforePublish++;
+    proc.kill();
+    violations.push(...service.violations);
+    up = false;
+    for (const l of links) l.drop();
+    clock.after(chaos.restartAfterMs ?? 500, restart);
+  }
+  function armCrash() {
+    if (!chaos.crashEveryMs) return;
+    clock.after(-Math.log(1 - crashRandom()) * chaos.crashEveryMs, () => {
+      if (crashRandom() < 0.5) crash();
+      else aimed = stages[Math.floor(crashRandom() * stages.length)];
+    });
+  }
+  function restart() {
+    proc = boot();
+    try {
+      service = TableService.restore(options(proc), disk.records);
+    } catch (e) {
+      if (!(e instanceof CorruptLogError)) throw e;
+      violations.push(`the restarted server refused its log: ${e.message}`);
+      broken = true;
+      return;
+    }
+    up = true;
+    armCrash();
+  }
+  armCrash();
+
   const limit = 30 * 60_000;
-  await clock.run({ until: () => service.state.handsPlayed >= hands && !service.state.hand, limit });
+  await clock.run({ until: () => broken || (up && service.state.handsPlayed >= hands && !service.state.hand), limit });
   // Let the network calm down and every message in flight land.
   for (const b of bots) b?.stop();
   for (const l of links) l.calm = true;
-  await clock.run({ limit: clock.now() + 10 * 60_000 });
+  calm = true;
+  await clock.run({ until: () => broken, limit: clock.now() + 10 * 60_000 });
+  const result = (): SimResult => {
+    const all = clients.flatMap((c) => [...c.results.values()]);
+    return {
+      violations,
+      handsPlayed: service.state.handsPlayed,
+      events: service.head,
+      commands: service.commits.length,
+      rejected: all.filter((x) => !x.ok).length,
+      timeouts: service.log.filter((e) => e.event.type === "ActionTaken" && e.event.timeout).length,
+      reconnects: links.reduce((n, l) => n + l.connections - 1, 0),
+      ...stats,
+      virtualMs: clock.now(),
+    };
+  };
+  if (broken) return result();
 
-  const violations: string[] = [];
   if (service.state.handsPlayed < hands) violations.push(`stalled: ${service.state.handsPlayed} of ${hands} hands in ${limit / 60_000} virtual minutes`);
   violations.push(...service.violations);
 
@@ -109,6 +195,9 @@ export async function simulate(opts: SimOptions): Promise<SimResult> {
   violations.push(...r.errors);
   if (JSON.stringify(r.events) !== JSON.stringify(service.log.map((e) => e.event))) violations.push("replaying the commands produced different events");
   if (JSON.stringify(r.state) !== JSON.stringify(service.state)) violations.push("replaying the commands produced a different table");
+  // And what the server published is exactly what is on disk.
+  if (JSON.stringify(disk.records.flatMap((x) => x.events)) !== JSON.stringify(service.log.map((e) => e.event)))
+    violations.push("the events on disk differ from the events the server published");
 
   const committed = new Set<string>();
   for (const c of service.commits) {
@@ -128,16 +217,5 @@ export async function simulate(opts: SimOptions): Promise<SimResult> {
         violations.push(`${who}: command ${id} was told ${res.ok ? "ok" : res.code} but ${committed.has(`${c.playerId}/${id}`) ? "was" : "was not"} applied`);
     }
   }
-
-  const all = clients.flatMap((c) => [...c.results.values()]);
-  return {
-    violations,
-    handsPlayed: service.state.handsPlayed,
-    events: service.head,
-    commands: service.commits.length,
-    rejected: all.filter((x) => !x.ok).length,
-    timeouts: service.log.filter((e) => e.event.type === "ActionTaken" && e.event.timeout).length,
-    reconnects: links.reduce((n, l) => n + l.connections - 1, 0),
-    virtualMs: clock.now(),
-  };
+  return result();
 }
